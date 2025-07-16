@@ -258,15 +258,18 @@ router.post("/verify-pin/:id", authenticate, async (req, res) => {
 router.get("/download/:id", authenticate, async (req, res) => {
   try {
     const { pin } = req.query
-    const document = await Document.findById(req.params.id)
+    const document = await Document.findById(req.params.id).populate("uploadedBy", "username email")
 
     if (!document) {
+      console.log("Document not found:", req.params.id)
       return res.status(404).json({ message: "Document not found" })
     }
 
     console.log("Download request for:", document.originalName)
     console.log("Access level:", document.accessLevel)
     console.log("User role:", req.user.role)
+    console.log("User ID:", req.user._id)
+    console.log("Document owner:", document.uploadedBy._id)
 
     // Check access permissions based on access level
     let hasAccess = false
@@ -274,10 +277,14 @@ router.get("/download/:id", authenticate, async (req, res) => {
     if (document.accessLevel === "public") {
       // Public files - anyone can access
       hasAccess = true
+      console.log("Access granted: Public file")
     } else if (document.accessLevel === "private") {
       // Private files - only uploader and admin can access
-      if (req.user.role === "admin" || document.uploadedBy.toString() === req.user._id.toString()) {
+      if (req.user.role === "admin" || document.uploadedBy._id.toString() === req.user._id.toString()) {
         hasAccess = true
+        console.log("Access granted: Private file - owner or admin")
+      } else {
+        console.log("Access denied: Private file - not owner or admin")
       }
     } else if (document.accessLevel === "protected") {
       // Protected files - anyone can access with correct PIN
@@ -290,16 +297,20 @@ router.get("/download/:id", authenticate, async (req, res) => {
           console.error("PIN comparison error:", error)
           hasAccess = false
         }
+      } else {
+        console.log("No PIN provided for protected file")
       }
     }
 
     if (!hasAccess) {
       if (document.accessLevel === "protected") {
+        console.log("Returning PIN required response")
         return res.status(401).json({
           message: "PIN required for protected document",
           requiresPin: true,
         })
       } else if (document.accessLevel === "private") {
+        console.log("Returning access denied response")
         return res.status(403).json({
           message: "Access denied. This is a private document.",
         })
@@ -307,31 +318,86 @@ router.get("/download/:id", authenticate, async (req, res) => {
     }
 
     try {
-      console.log("Downloading from Dropbox:", document.dropboxPath)
+      console.log("Attempting to download from Dropbox:", document.dropboxPath)
+
+      // Validate dropbox path exists
+      if (!document.dropboxPath) {
+        console.error("No Dropbox path found for document:", document._id)
+        return res.status(500).json({
+          message: "File path not found. This file may have been corrupted during upload.",
+        })
+      }
+
       // Download file from Dropbox
       const fileBuffer = await downloadFromDropbox(document.dropboxPath)
 
-      // Increment download count
-      document.downloadCount += 1
-      await document.save()
+      if (!fileBuffer) {
+        console.error("No file buffer returned from Dropbox")
+        return res.status(500).json({ message: "Failed to retrieve file from Dropbox storage" })
+      }
 
-      console.log("Download successful, sending file to client")
+      console.log("File downloaded from Dropbox successfully, buffer size:", fileBuffer.length)
+
+      // Increment download count
+      try {
+        document.downloadCount = (document.downloadCount || 0) + 1
+        await document.save()
+        console.log("Download count updated to:", document.downloadCount)
+      } catch (countError) {
+        console.error("Failed to update download count:", countError)
+        // Continue with download even if count update fails
+      }
+
+      console.log("Sending file to client...")
 
       // Set proper headers for file download
-      res.setHeader("Content-Disposition", `attachment; filename="${document.originalName}"`)
-      res.setHeader("Content-Type", document.mimetype)
+      res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(document.originalName)}"`)
+      res.setHeader("Content-Type", document.mimetype || "application/octet-stream")
       res.setHeader("Content-Length", fileBuffer.length)
+      res.setHeader("Cache-Control", "no-cache")
 
       // Send the file buffer
       res.send(fileBuffer)
+
+      console.log("File sent to client successfully")
     } catch (dropboxError) {
-      console.error("Dropbox download error:", dropboxError)
-      return res.status(500).json({ message: "File not found in Dropbox storage: " + dropboxError.message })
+      console.error("Dropbox download error details:", {
+        message: dropboxError.message,
+        status: dropboxError.status,
+        path: document.dropboxPath,
+        documentId: document._id,
+      })
+
+      if (dropboxError.message.includes("not found") || dropboxError.status === 409) {
+        return res.status(404).json({
+          message: "File not found in Dropbox storage. It may have been moved or deleted.",
+          details: "Please contact support if this file should exist.",
+        })
+      } else if (dropboxError.message.includes("authentication") || dropboxError.status === 401) {
+        return res.status(500).json({
+          message: "Cloud storage authentication error. Please try again later.",
+          details: "Contact support if the problem persists.",
+        })
+      } else {
+        return res.status(500).json({
+          message: "Failed to download file from cloud storage: " + dropboxError.message,
+          details: "Please try again or contact support.",
+        })
+      }
     }
   } catch (error) {
-    console.error("Download error:", error)
+    console.error("Download route error:", {
+      message: error.message,
+      stack: error.stack,
+      documentId: req.params.id,
+      userId: req.user?._id,
+    })
+
     if (!res.headersSent) {
-      res.status(500).json({ message: error.message })
+      res.status(500).json({
+        message: "Download failed due to server error",
+        details: process.env.NODE_ENV === "development" ? error.message : "Please try again or contact support.",
+      })
     }
   }
 })

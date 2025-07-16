@@ -78,17 +78,43 @@ export const downloadFromDropbox = async (dropboxPath) => {
   try {
     console.log("Downloading from Dropbox path:", dropboxPath)
 
-    const response = await dbx.filesDownload({ path: dropboxPath })
-    console.log("Dropbox download successful")
+    if (!dropboxPath) {
+      throw new Error("Dropbox path is required")
+    }
 
+    // Ensure path starts with /
+    const normalizedPath = dropboxPath.startsWith("/") ? dropboxPath : `/${dropboxPath}`
+
+    const response = await dbx.filesDownload({ path: normalizedPath })
+
+    if (!response || !response.result) {
+      throw new Error("Invalid response from Dropbox")
+    }
+
+    console.log("Dropbox download successful, file size:", response.result.fileBinary?.length || 0)
+
+    // Return the file binary data
     return response.result.fileBinary
   } catch (error) {
-    console.error("Dropbox download error:", error)
+    console.error("Dropbox download error details:", {
+      message: error.message,
+      status: error.status,
+      error_summary: error.error?.error_summary,
+      path: dropboxPath,
+    })
 
     if (error.status === 409) {
+      // File not found
       throw new Error("File not found in Dropbox")
     } else if (error.status === 401) {
+      // Authentication error
       throw new Error("Dropbox authentication failed")
+    } else if (error.status === 429) {
+      // Rate limit
+      throw new Error("Dropbox rate limit exceeded. Please try again later.")
+    } else if (error.message.includes("network") || error.code === "ENOTFOUND") {
+      // Network error
+      throw new Error("Network error connecting to Dropbox")
     } else {
       throw new Error(`Dropbox download failed: ${error.message}`)
     }
