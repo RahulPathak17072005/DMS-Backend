@@ -1,16 +1,26 @@
 import express from "express"
-import fs from "fs"
-import path from "path"
 import bcrypt from "bcryptjs"
 import Document from "../models/Document.js"
 import { authenticate } from "../middleware/auth.js"
-import { upload, calculateFileHash } from "../middleware/upload.js"
+import {
+  upload,
+  calculateFileHash,
+  uploadToDropbox,
+  downloadFromDropbox,
+  deleteFromDropbox,
+} from "../middleware/upload.js"
+import path from "path"
 
 const router = express.Router()
 
-// Upload document with version control
+// Upload document with version control and Dropbox storage
 router.post("/upload", authenticate, upload.single("document"), async (req, res) => {
   try {
+    console.log("Upload request received")
+    console.log("User:", req.user.username)
+    console.log("File:", req.file ? req.file.originalname : "No file")
+    console.log("Body:", req.body)
+
     if (!req.file) {
       return res.status(400).json({ message: "No file uploaded" })
     }
@@ -27,8 +37,15 @@ router.post("/upload", authenticate, upload.single("document"), async (req, res)
       return res.status(400).json({ message: "Protected files require a PIN of at least 4 characters" })
     }
 
-    // Calculate file hash
-    const fileHash = await calculateFileHash(req.file.path)
+    console.log("Calculating file hash...")
+    // Calculate file hash from buffer
+    const fileHash = calculateFileHash(req.file.buffer)
+    console.log("File hash calculated:", fileHash.substring(0, 10) + "...")
+
+    console.log("Uploading to Dropbox...")
+    // Upload to Dropbox
+    const dropboxResult = await uploadToDropbox(req.file.buffer, req.file.originalname, req.file.originalname)
+    console.log("Dropbox upload result:", dropboxResult)
 
     // Determine category based on mimetype
     let category = "other"
@@ -43,6 +60,7 @@ router.post("/upload", authenticate, upload.single("document"), async (req, res)
     // Create base filename (without extension for version control)
     const baseFileName = path.parse(req.file.originalname).name
 
+    console.log("Checking for existing documents...")
     // Check for existing documents with same base filename by same user
     const existingDocs = await Document.find({
       baseFileName: baseFileName,
@@ -53,37 +71,36 @@ router.post("/upload", authenticate, upload.single("document"), async (req, res)
     let parentDocument = null
 
     if (existingDocs.length > 0) {
-      // Check if file content is different
-      const latestDoc = existingDocs[0]
-      if (latestDoc.fileHash === fileHash) {
-        // Same file content, don't create new version
-        fs.unlinkSync(req.file.path) // Delete uploaded file
-        return res.status(400).json({
-          message: "This file already exists with the same content",
-          existingDocument: latestDoc,
-        })
-      }
-
+      console.log("Found existing versions:", existingDocs.length)
       // New version of existing file
-      version = latestDoc.version + 1
-      parentDocument = latestDoc.parentDocument || latestDoc._id
+      version = existingDocs[0].version + 1
+      parentDocument = existingDocs[0].parentDocument || existingDocs[0]._id
 
       // Mark previous versions as not latest
-      await Document.updateMany({ baseFileName: baseFileName, uploadedBy: req.user._id }, { isLatestVersion: false })
+      await Document.updateMany(
+        {
+          baseFileName: baseFileName,
+          uploadedBy: req.user._id,
+        },
+        { isLatestVersion: false },
+      )
     }
 
     // Hash PIN if provided
     let hashedPin = null
     if (accessLevel === "protected" && accessPin) {
+      console.log("Hashing PIN...")
       hashedPin = await bcrypt.hash(accessPin, 10)
     }
 
+    console.log("Creating document record...")
     const document = new Document({
-      filename: req.file.filename,
+      filename: dropboxResult.filename,
       originalName: req.file.originalname,
       mimetype: req.file.mimetype,
       size: req.file.size,
-      path: req.file.path,
+      dropboxPath: dropboxResult.dropboxPath,
+      dropboxFileId: dropboxResult.dropboxFileId,
       uploadedBy: req.user._id,
       category,
       description: description || "",
@@ -98,6 +115,7 @@ router.post("/upload", authenticate, upload.single("document"), async (req, res)
     })
 
     await document.save()
+    console.log("Document saved to database:", document._id)
 
     // Update version history for all versions of this document
     const versionHistoryEntry = {
@@ -116,17 +134,30 @@ router.post("/upload", authenticate, upload.single("document"), async (req, res)
 
     await document.populate("uploadedBy", "username email")
 
+    console.log("Upload completed successfully")
     res.status(201).json({
-      message: `Document uploaded successfully${version > 1 ? ` (Version ${version})` : ""}`,
+      message: `Document uploaded successfully to Dropbox${version > 1 ? ` (Version ${version})` : ""}`,
       document,
       isNewVersion: version > 1,
+      version: version,
     })
   } catch (error) {
-    // Clean up uploaded file on error
-    if (req.file && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path)
+    console.error("Upload error:", error)
+
+    // Provide more specific error messages
+    if (error.message.includes("Dropbox")) {
+      res.status(500).json({
+        message: "Cloud storage error: " + error.message,
+        details: "Please check your Dropbox configuration and try again.",
+      })
+    } else if (error.message.includes("validation")) {
+      res.status(400).json({ message: error.message })
+    } else {
+      res.status(500).json({
+        message: "Upload failed: " + error.message,
+        details: "Please try again or contact support if the problem persists.",
+      })
     }
-    res.status(500).json({ message: error.message })
   }
 })
 
@@ -141,6 +172,7 @@ router.get("/", authenticate, async (req, res) => {
       query.$or = [
         { uploadedBy: req.user._id }, // Own documents
         { accessLevel: "public" }, // Public documents
+        { accessLevel: "protected" }, // Protected documents (can be accessed with PIN)
       ]
     }
 
@@ -182,6 +214,7 @@ router.get("/", authenticate, async (req, res) => {
       total,
     })
   } catch (error) {
+    console.error("Get documents error:", error)
     res.status(500).json({ message: error.message })
   }
 })
@@ -200,24 +233,28 @@ router.post("/verify-pin/:id", authenticate, async (req, res) => {
       return res.status(400).json({ message: "This document is not protected" })
     }
 
-    // Check access permissions
-    if (req.user.role !== "admin" && document.uploadedBy.toString() !== req.user._id.toString()) {
-      // For protected documents, anyone can try to access with PIN
+    if (!pin) {
+      return res.status(400).json({ message: "PIN is required" })
     }
+
+    console.log("Verifying PIN for document:", document.originalName)
 
     // Verify PIN
     const isValidPin = await bcrypt.compare(pin, document.accessPin)
     if (!isValidPin) {
+      console.log("Invalid PIN provided")
       return res.status(401).json({ message: "Invalid PIN" })
     }
 
+    console.log("PIN verified successfully")
     res.json({ message: "PIN verified successfully", verified: true })
   } catch (error) {
+    console.error("PIN verification error:", error)
     res.status(500).json({ message: error.message })
   }
 })
 
-// Download document with access control
+// Download document with access control and Dropbox integration
 router.get("/download/:id", authenticate, async (req, res) => {
   try {
     const { pin } = req.query
@@ -227,56 +264,70 @@ router.get("/download/:id", authenticate, async (req, res) => {
       return res.status(404).json({ message: "Document not found" })
     }
 
-    // Check access permissions
+    console.log("Download request for:", document.originalName)
+    console.log("Access level:", document.accessLevel)
+    console.log("User role:", req.user.role)
+
+    // Check access permissions based on access level
     let hasAccess = false
 
-    if (req.user.role === "admin") {
+    if (document.accessLevel === "public") {
+      // Public files - anyone can access
       hasAccess = true
-    } else if (document.uploadedBy.toString() === req.user._id.toString()) {
-      hasAccess = true
-    } else if (document.accessLevel === "public") {
-      hasAccess = true
-    } else if (document.accessLevel === "protected" && pin) {
-      const isValidPin = await bcrypt.compare(pin, document.accessPin)
-      hasAccess = isValidPin
+    } else if (document.accessLevel === "private") {
+      // Private files - only uploader and admin can access
+      if (req.user.role === "admin" || document.uploadedBy.toString() === req.user._id.toString()) {
+        hasAccess = true
+      }
+    } else if (document.accessLevel === "protected") {
+      // Protected files - anyone can access with correct PIN
+      if (pin) {
+        try {
+          const isValidPin = await bcrypt.compare(pin, document.accessPin)
+          hasAccess = isValidPin
+          console.log("PIN validation result:", hasAccess)
+        } catch (error) {
+          console.error("PIN comparison error:", error)
+          hasAccess = false
+        }
+      }
     }
 
     if (!hasAccess) {
       if (document.accessLevel === "protected") {
-        return res.status(401).json({ message: "PIN required for protected document" })
-      } else {
-        return res.status(403).json({ message: "Access denied" })
+        return res.status(401).json({
+          message: "PIN required for protected document",
+          requiresPin: true,
+        })
+      } else if (document.accessLevel === "private") {
+        return res.status(403).json({
+          message: "Access denied. This is a private document.",
+        })
       }
     }
 
-    // Construct the full file path
-    const filePath = path.resolve(document.path)
+    try {
+      console.log("Downloading from Dropbox:", document.dropboxPath)
+      // Download file from Dropbox
+      const fileBuffer = await downloadFromDropbox(document.dropboxPath)
 
-    // Check if file exists
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ message: "File not found on server" })
+      // Increment download count
+      document.downloadCount += 1
+      await document.save()
+
+      console.log("Download successful, sending file to client")
+
+      // Set proper headers for file download
+      res.setHeader("Content-Disposition", `attachment; filename="${document.originalName}"`)
+      res.setHeader("Content-Type", document.mimetype)
+      res.setHeader("Content-Length", fileBuffer.length)
+
+      // Send the file buffer
+      res.send(fileBuffer)
+    } catch (dropboxError) {
+      console.error("Dropbox download error:", dropboxError)
+      return res.status(500).json({ message: "File not found in Dropbox storage: " + dropboxError.message })
     }
-
-    // Increment download count
-    document.downloadCount += 1
-    await document.save()
-
-    // Set proper headers for file download
-    res.setHeader("Content-Disposition", `attachment; filename="${document.originalName}"`)
-    res.setHeader("Content-Type", document.mimetype)
-    res.setHeader("Content-Length", document.size)
-
-    // Create read stream and pipe to response
-    const fileStream = fs.createReadStream(filePath)
-
-    fileStream.on("error", (error) => {
-      console.error("File stream error:", error)
-      if (!res.headersSent) {
-        res.status(500).json({ message: "Error reading file" })
-      }
-    })
-
-    fileStream.pipe(res)
   } catch (error) {
     console.error("Download error:", error)
     if (!res.headersSent) {
@@ -311,6 +362,7 @@ router.get("/:id/versions", authenticate, async (req, res) => {
 
     res.json({ versions })
   } catch (error) {
+    console.error("Get versions error:", error)
     res.status(500).json({ message: error.message })
   }
 })
@@ -329,9 +381,13 @@ router.delete("/:id", authenticate, async (req, res) => {
       return res.status(403).json({ message: "Access denied" })
     }
 
-    // Delete file from filesystem
-    if (fs.existsSync(document.path)) {
-      fs.unlinkSync(document.path)
+    try {
+      // Delete file from Dropbox
+      await deleteFromDropbox(document.dropboxPath)
+      console.log("File deleted from Dropbox successfully")
+    } catch (dropboxError) {
+      console.error("Dropbox delete error:", dropboxError)
+      // Continue with database deletion even if Dropbox deletion fails
     }
 
     // If this is the latest version, mark the previous version as latest
@@ -359,8 +415,9 @@ router.delete("/:id", authenticate, async (req, res) => {
     // Delete from database
     await Document.findByIdAndDelete(req.params.id)
 
-    res.json({ message: "Document deleted successfully" })
+    res.json({ message: "Document deleted successfully from both database and Dropbox" })
   } catch (error) {
+    console.error("Delete error:", error)
     res.status(500).json({ message: error.message })
   }
 })

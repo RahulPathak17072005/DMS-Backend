@@ -18,7 +18,12 @@ const documentSchema = new mongoose.Schema(
       type: Number,
       required: true,
     },
-    path: {
+    // Changed from local path to Dropbox path
+    dropboxPath: {
+      type: String,
+      required: true,
+    },
+    dropboxFileId: {
       type: String,
       required: true,
     },
