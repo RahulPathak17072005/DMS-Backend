@@ -1,7 +1,6 @@
 import multer from "multer"
 import path from "path"
 import crypto from "crypto"
-import dbx from "../config/dropbox.js"
 
 // Use memory storage instead of disk storage for Dropbox upload
 const storage = multer.memoryStorage()
@@ -29,6 +28,14 @@ export const calculateFileHash = (buffer) => {
 export const uploadToDropbox = async (fileBuffer, filename, originalName) => {
   try {
     console.log("Starting Dropbox upload for:", originalName)
+
+    // Import Dropbox client with error handling
+    let dbx
+    try {
+      dbx = (await import("../config/dropbox.js")).default
+    } catch (importError) {
+      throw new Error("Failed to initialize Dropbox client: " + importError.message)
+    }
 
     // Create a unique filename to avoid conflicts
     const timestamp = Date.now()
@@ -76,8 +83,7 @@ export const uploadToDropbox = async (fileBuffer, filename, originalName) => {
 // Function to download file from Dropbox with better error handling
 export const downloadFromDropbox = async (dropboxPath) => {
   try {
-    console.log("  📥 Starting Dropbox download...")
-    console.log("    - Path:", dropboxPath)
+    console.log("📥 Starting Dropbox download for path:", dropboxPath)
 
     if (!dropboxPath) {
       throw new Error("Dropbox path is required")
@@ -85,79 +91,48 @@ export const downloadFromDropbox = async (dropboxPath) => {
 
     // Ensure path starts with /
     const normalizedPath = dropboxPath.startsWith("/") ? dropboxPath : `/${dropboxPath}`
-    console.log("    - Normalized Path:", normalizedPath)
 
-    // Import Dropbox client
+    // Import Dropbox client with error handling
     let dbxClient
     try {
       dbxClient = (await import("../config/dropbox.js")).default
-      console.log("    ✅ Dropbox client imported successfully")
     } catch (importError) {
-      console.error("    ❌ Failed to import Dropbox client:", importError)
       throw new Error("Failed to initialize Dropbox client: " + importError.message)
     }
 
     // Test connection first
-    console.log("    🔗 Testing Dropbox connection...")
     try {
-      const accountInfo = await dbxClient.usersGetCurrentAccount()
-      console.log("    ✅ Connection test successful")
-      console.log("      - Account:", accountInfo.result.name.display_name)
+      await dbxClient.usersGetCurrentAccount()
     } catch (connectionError) {
-      console.error("    ❌ Connection test failed:", connectionError)
       throw new Error("Dropbox connection failed: " + connectionError.message)
     }
 
     // Attempt file download
-    console.log("    📁 Attempting file download...")
     const response = await dbxClient.filesDownload({ path: normalizedPath })
 
-    if (!response) {
-      console.error("    ❌ No response from Dropbox API")
-      throw new Error("No response from Dropbox API")
-    }
-
-    if (!response.result) {
-      console.error("    ❌ No result in Dropbox response")
-      throw new Error("Invalid response structure from Dropbox")
+    if (!response || !response.result || !response.result.fileBinary) {
+      throw new Error("Invalid response from Dropbox API")
     }
 
     const fileBuffer = response.result.fileBinary
-    if (!fileBuffer) {
-      console.error("    ❌ No file binary in response")
-      throw new Error("No file data returned from Dropbox")
-    }
-
-    console.log("    ✅ Dropbox download successful")
-    console.log("      - File Name:", response.result.name)
-    console.log("      - File Size:", fileBuffer.length, "bytes")
-    console.log("      - Path Display:", response.result.path_display)
-    console.log("      - Content Hash:", response.result.content_hash?.substring(0, 10) + "...")
+    console.log("✅ Dropbox download successful, size:", fileBuffer.length)
 
     return fileBuffer
   } catch (error) {
-    console.error("  ❌ Dropbox download error:")
-    console.error("    - Message:", error.message)
-    console.error("    - Status:", error.status)
-    console.error("    - Error Summary:", error.error?.error_summary)
-    console.error("    - Path:", dropboxPath)
+    console.error("❌ Dropbox download error:", {
+      message: error.message,
+      status: error.status,
+      path: dropboxPath,
+    })
 
     if (error.status === 409) {
-      // File not found
-      const errorDetails = error.error?.error?.[".tag"] || "file_not_found"
-      throw new Error(`File not found in Dropbox: ${errorDetails}`)
+      throw new Error("File not found in Dropbox")
     } else if (error.status === 401) {
-      // Authentication error
-      throw new Error("Dropbox authentication failed - invalid or expired token")
+      throw new Error("Dropbox authentication failed")
     } else if (error.status === 429) {
-      // Rate limit
-      throw new Error("Dropbox rate limit exceeded. Please try again later.")
+      throw new Error("Dropbox rate limit exceeded")
     } else if (error.message.includes("network") || error.code === "ENOTFOUND") {
-      // Network error
       throw new Error("Network error connecting to Dropbox")
-    } else if (error.message.includes("connection")) {
-      // Connection error
-      throw new Error("Failed to connect to Dropbox: " + error.message)
     } else {
       throw new Error(`Dropbox download failed: ${error.message}`)
     }
@@ -169,6 +144,8 @@ export const deleteFromDropbox = async (dropboxPath) => {
   try {
     console.log("Deleting from Dropbox path:", dropboxPath)
 
+    // Import Dropbox client
+    const dbx = (await import("../config/dropbox.js")).default
     await dbx.filesDeleteV2({ path: dropboxPath })
     console.log("Dropbox delete successful")
 

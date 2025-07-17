@@ -13,6 +13,15 @@ import path from "path"
 
 const router = express.Router()
 
+// Simple health check for documents route
+router.get("/health", (req, res) => {
+  res.json({
+    status: "OK",
+    timestamp: new Date().toISOString(),
+    message: "Documents route is working",
+  })
+})
+
 // Test endpoint to check document and Dropbox connectivity
 router.get("/test-download/:id", authenticate, async (req, res) => {
   try {
@@ -330,336 +339,118 @@ router.post("/verify-pin/:id", authenticate, async (req, res) => {
 
 // Download document with access control and Dropbox integration
 router.get("/download/:id", authenticate, async (req, res) => {
-  const startTime = Date.now()
-  let document = null
+  // Set up error handling that won't crash the server
+  const handleError = (error, step = "unknown") => {
+    console.error(`❌ Download error at step ${step}:`, {
+      message: error.message,
+      name: error.name,
+      documentId: req.params.id,
+      userId: req.user?._id,
+      timestamp: new Date().toISOString(),
+    })
 
-  // Wrap everything in try-catch to prevent crashes
+    if (!res.headersSent) {
+      res.status(500).json({
+        message: "Download failed",
+        error: error.message,
+        step: step,
+        timestamp: new Date().toISOString(),
+      })
+    }
+  }
+
   try {
-    // Basic request validation first
-    if (!req.params.id) {
-      console.error("❌ No document ID provided")
-      return res.status(400).json({
-        message: "Document ID is required",
-        error: "MISSING_DOCUMENT_ID",
-      })
+    console.log("🚀 Download request started for document:", req.params.id)
+
+    // Basic validation
+    if (!req.params.id || req.params.id.length !== 24) {
+      return res.status(400).json({ message: "Invalid document ID" })
     }
 
-    if (req.params.id.length !== 24) {
-      console.error("❌ Invalid document ID format:", req.params.id)
-      return res.status(400).json({
-        message: "Invalid document ID format",
-        error: "INVALID_DOCUMENT_ID",
-      })
-    }
-
-    console.log("\n" + "=".repeat(50))
-    console.log("🚀 DOWNLOAD REQUEST STARTED")
-    console.log("=".repeat(50))
-    console.log("📋 Request Details:")
-    console.log("  - Document ID:", req.params.id)
-    console.log("  - User ID:", req.user?._id || "Unknown")
-    console.log("  - User Role:", req.user?.role || "Unknown")
-    console.log("  - User Email:", req.user?.email || "Unknown")
-    console.log("  - Query params:", JSON.stringify(req.query))
-    console.log("  - Timestamp:", new Date().toISOString())
-
-    const { pin } = req.query
-
-    console.log("\n📊 Step 1: Finding document in database...")
-
-    // Find document with error handling
+    // Find document
+    let document
     try {
       document = await Document.findById(req.params.id).populate("uploadedBy", "username email _id")
     } catch (dbError) {
-      console.error("❌ Database query failed:", dbError.message)
-      return res.status(500).json({
-        message: "Database error while finding document",
-        error: "DATABASE_ERROR",
-        details: dbError.message,
-      })
+      return handleError(dbError, "database_query")
     }
 
     if (!document) {
-      console.log("❌ Document not found in database")
-      return res.status(404).json({
-        message: "Document not found",
-        error: "DOCUMENT_NOT_FOUND",
-      })
+      return res.status(404).json({ message: "Document not found" })
     }
 
-    console.log("✅ Document found successfully:")
-    console.log("  - ID:", document._id)
-    console.log("  - Name:", document.originalName)
-    console.log("  - Access Level:", document.accessLevel)
-    console.log("  - Size:", document.size, "bytes")
-    console.log("  - MIME Type:", document.mimetype)
-    console.log("  - Uploaded By:", document.uploadedBy?.username || "Unknown")
-    console.log("  - Uploader ID:", document.uploadedBy?._id || "Unknown")
-    console.log("  - Dropbox Path:", document.dropboxPath)
-    console.log("  - Created:", document.createdAt)
-
-    // Validate required document fields
-    console.log("\n🔍 Step 2: Validating document data...")
-
-    const validationErrors = []
-    if (!document.dropboxPath) validationErrors.push("Missing Dropbox path")
-    if (!document.uploadedBy) validationErrors.push("Missing uploader information")
-    if (!document.originalName) validationErrors.push("Missing original filename")
-    if (!document.size || document.size <= 0) validationErrors.push("Invalid file size")
-
-    if (validationErrors.length > 0) {
-      console.error("❌ Document validation failed:", validationErrors)
-      return res.status(500).json({
-        message: "Document data validation failed: " + validationErrors.join(", "),
-        error: "INVALID_DOCUMENT_DATA",
-        validationErrors,
-      })
-    }
-
-    console.log("✅ Document data validation passed")
+    console.log("✅ Document found:", document.originalName)
 
     // Check access permissions
-    console.log("\n🔐 Step 3: Checking access permissions...")
-
+    const { pin } = req.query
     let hasAccess = false
-    let accessReason = ""
 
     try {
       if (document.accessLevel === "public") {
         hasAccess = true
-        accessReason = "Public file - accessible to all users"
       } else if (document.accessLevel === "private") {
-        if (req.user.role === "admin") {
-          hasAccess = true
-          accessReason = "Admin access to private file"
-        } else if (document.uploadedBy._id.toString() === req.user._id.toString()) {
-          hasAccess = true
-          accessReason = "Owner access to private file"
-        } else {
-          accessReason = "Access denied - private file, user is not owner or admin"
-        }
+        hasAccess = req.user.role === "admin" || document.uploadedBy._id.toString() === req.user._id.toString()
       } else if (document.accessLevel === "protected") {
-        if (pin) {
-          if (!document.accessPin) {
-            console.error("❌ Protected file has no PIN hash stored")
-            return res.status(500).json({
-              message: "Protected file configuration error - no PIN set",
-              error: "MISSING_PIN_HASH",
-            })
-          }
-
-          console.log("🔑 Verifying PIN for protected file...")
-          const isValidPin = await bcrypt.compare(pin, document.accessPin)
-          if (isValidPin) {
-            hasAccess = true
-            accessReason = "Valid PIN provided for protected file"
-            console.log("✅ PIN verification successful")
-          } else {
-            accessReason = "Invalid PIN provided for protected file"
-            console.log("❌ PIN verification failed")
-          }
-        } else {
-          accessReason = "No PIN provided for protected file"
+        if (pin && document.accessPin) {
+          hasAccess = await bcrypt.compare(pin, document.accessPin)
         }
-      } else {
-        accessReason = "Unknown access level: " + document.accessLevel
       }
     } catch (accessError) {
-      console.error("❌ Access check failed:", accessError)
-      return res.status(500).json({
-        message: "Access permission check failed",
-        error: "ACCESS_CHECK_ERROR",
-        details: accessError.message,
-      })
+      return handleError(accessError, "access_check")
     }
-
-    console.log("🔐 Access Check Result:")
-    console.log("  - Has Access:", hasAccess)
-    console.log("  - Reason:", accessReason)
 
     if (!hasAccess) {
       if (document.accessLevel === "protected") {
-        console.log("🔐 Returning PIN required response")
-        return res.status(401).json({
-          message: "PIN required for protected document",
-          requiresPin: true,
-        })
-      } else if (document.accessLevel === "private") {
-        console.log("🔒 Returning access denied response")
-        return res.status(403).json({
-          message: "Access denied. This is a private document.",
-        })
-      } else {
-        console.log("❌ Access denied for unknown reason")
-        return res.status(403).json({
-          message: "Access denied.",
-        })
+        return res.status(401).json({ message: "PIN required", requiresPin: true })
       }
+      return res.status(403).json({ message: "Access denied" })
     }
 
-    console.log("✅ Access granted:", accessReason)
+    console.log("✅ Access granted")
 
     // Test Dropbox connection
-    console.log("\n☁️ Step 4: Testing Dropbox connection...")
-
     let dbxClient
     try {
       dbxClient = (await import("../config/dropbox.js")).default
-      const accountInfo = await dbxClient.usersGetCurrentAccount()
-      console.log("✅ Dropbox connection successful")
-      console.log("  - Account:", accountInfo.result.name.display_name)
-      console.log("  - Email:", accountInfo.result.email)
-    } catch (connectionError) {
-      console.error("❌ Dropbox connection failed:", connectionError)
-      return res.status(500).json({
-        message: "Cloud storage connection failed: " + connectionError.message,
-        error: "DROPBOX_CONNECTION_ERROR",
-        details: connectionError.message,
-      })
+      await dbxClient.usersGetCurrentAccount()
+    } catch (dropboxConnError) {
+      return handleError(dropboxConnError, "dropbox_connection")
     }
 
-    // Download file from Dropbox
-    console.log("\n📥 Step 5: Downloading file from Dropbox...")
-    console.log("  - Dropbox Path:", document.dropboxPath)
-    console.log("  - Expected Size:", document.size, "bytes")
+    console.log("✅ Dropbox connection verified")
 
+    // Download file
     let fileBuffer
     try {
       fileBuffer = await downloadFromDropbox(document.dropboxPath)
-
-      if (!fileBuffer) {
-        console.error("❌ No file buffer returned from Dropbox")
-        return res.status(500).json({
-          message: "Failed to retrieve file from Dropbox storage - empty response",
-          error: "EMPTY_FILE_BUFFER",
-        })
-      }
-
-      if (fileBuffer.length === 0) {
-        console.error("❌ Empty file buffer returned from Dropbox")
-        return res.status(500).json({
-          message: "Failed to retrieve file from Dropbox storage - empty file",
-          error: "EMPTY_FILE_CONTENT",
-        })
-      }
-
-      console.log("✅ File downloaded from Dropbox successfully")
-      console.log("  - Buffer Size:", fileBuffer.length, "bytes")
-      console.log("  - Expected Size:", document.size, "bytes")
-      console.log("  - Size Match:", fileBuffer.length === document.size ? "✅" : "⚠️")
-    } catch (dropboxError) {
-      console.error("❌ Dropbox download error:", {
-        message: dropboxError.message,
-        status: dropboxError.status,
-        path: document.dropboxPath,
-        documentId: document._id,
-      })
-
-      if (dropboxError.message.includes("not found") || dropboxError.status === 409) {
-        return res.status(404).json({
-          message: "File not found in Dropbox storage. It may have been moved or deleted.",
-          details: "Please contact support if this file should exist.",
-          error: "DROPBOX_FILE_NOT_FOUND",
-        })
-      } else if (dropboxError.message.includes("authentication") || dropboxError.status === 401) {
-        return res.status(500).json({
-          message: "Cloud storage authentication error. Please try again later.",
-          details: "Contact support if the problem persists.",
-          error: "DROPBOX_AUTH_ERROR",
-        })
-      } else if (dropboxError.message.includes("rate limit") || dropboxError.status === 429) {
-        return res.status(429).json({
-          message: "Too many requests. Please try again later.",
-          error: "DROPBOX_RATE_LIMIT",
-        })
-      } else {
-        return res.status(500).json({
-          message: "Failed to download file from cloud storage: " + dropboxError.message,
-          details: "Please try again or contact support.",
-          error: "DROPBOX_DOWNLOAD_ERROR",
-        })
-      }
+    } catch (downloadError) {
+      return handleError(downloadError, "dropbox_download")
     }
 
-    // Update download count
-    console.log("\n📊 Step 6: Updating download statistics...")
+    if (!fileBuffer || fileBuffer.length === 0) {
+      return res.status(500).json({ message: "Empty file received from Dropbox" })
+    }
+
+    console.log("✅ File downloaded, size:", fileBuffer.length)
+
+    // Update download count (don't fail if this fails)
     try {
       document.downloadCount = (document.downloadCount || 0) + 1
       await document.save()
-      console.log("✅ Download count updated to:", document.downloadCount)
     } catch (countError) {
-      console.error("⚠️ Failed to update download count:", countError.message)
-      // Continue with download even if count update fails
+      console.warn("⚠️ Failed to update download count:", countError.message)
     }
 
-    // Prepare response headers
-    console.log("\n📤 Step 7: Preparing file response...")
+    // Send file
     const filename = encodeURIComponent(document.originalName)
-    const mimetype = document.mimetype || "application/octet-stream"
-
-    console.log("  - Original Filename:", document.originalName)
-    console.log("  - Encoded Filename:", filename)
-    console.log("  - MIME Type:", mimetype)
-    console.log("  - Content Length:", fileBuffer.length)
-
-    // Set response headers
     res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${filename}`)
-    res.setHeader("Content-Type", mimetype)
+    res.setHeader("Content-Type", document.mimetype || "application/octet-stream")
     res.setHeader("Content-Length", fileBuffer.length)
-    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate")
-    res.setHeader("Pragma", "no-cache")
-    res.setHeader("Expires", "0")
-    res.setHeader("Access-Control-Expose-Headers", "Content-Disposition")
-
-    // Send the file
-    console.log("📤 Sending file to client...")
     res.send(fileBuffer)
 
-    const endTime = Date.now()
-    console.log("\n" + "=".repeat(50))
-    console.log("✅ DOWNLOAD COMPLETED SUCCESSFULLY")
-    console.log("=".repeat(50))
-    console.log("📊 Summary:")
-    console.log("  - File:", document.originalName)
-    console.log("  - Size:", fileBuffer.length, "bytes")
-    console.log("  - User:", req.user.email)
-    console.log("  - Duration:", endTime - startTime, "ms")
-    console.log("  - Timestamp:", new Date().toISOString())
-    console.log("=".repeat(50) + "\n")
-  } catch (error) {
-    const endTime = Date.now()
-    console.error("\n" + "=".repeat(50))
-    console.error("❌ DOWNLOAD FAILED WITH CRITICAL ERROR")
-    console.error("=".repeat(50))
-    console.error("💥 Critical Error Details:")
-    console.error("  - Message:", error.message)
-    console.error("  - Name:", error.name)
-    console.error("  - Stack:", error.stack?.split("\n").slice(0, 5).join("\n"))
-    console.error("  - Document ID:", req.params.id)
-    console.error("  - User ID:", req.user?._id)
-    console.error("  - User Email:", req.user?.email)
-    console.error("  - Duration:", endTime - startTime, "ms")
-    console.error("  - Timestamp:", new Date().toISOString())
-
-    if (document) {
-      console.error("  - Document Info:")
-      console.error("    - Name:", document.originalName)
-      console.error("    - Access Level:", document.accessLevel)
-      console.error("    - Dropbox Path:", document.dropboxPath)
-      console.error("    - Size:", document.size)
-    }
-    console.error("=".repeat(50) + "\n")
-
-    // Only send response if headers haven't been sent
-    if (!res.headersSent) {
-      res.status(500).json({
-        message: "Download failed due to critical server error",
-        details: process.env.NODE_ENV === "development" ? error.message : "Please try again or contact support.",
-        error: "CRITICAL_SERVER_ERROR",
-        timestamp: new Date().toISOString(),
-        documentId: req.params.id,
-      })
-    }
+    console.log("✅ Download completed successfully")
+  } catch (criticalError) {
+    handleError(criticalError, "critical")
   }
 })
 
