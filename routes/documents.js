@@ -13,6 +13,80 @@ import path from "path"
 
 const router = express.Router()
 
+// Test endpoint to check document and Dropbox connectivity
+router.get("/test-download/:id", authenticate, async (req, res) => {
+  try {
+    console.log("🧪 TEST DOWNLOAD ENDPOINT - Document ID:", req.params.id)
+
+    // Find document
+    const document = await Document.findById(req.params.id).populate("uploadedBy", "username email _id")
+
+    if (!document) {
+      return res.json({
+        success: false,
+        error: "Document not found",
+        documentId: req.params.id,
+      })
+    }
+
+    // Test Dropbox connection
+    let dropboxStatus = "unknown"
+    let dropboxError = null
+
+    try {
+      const dbx = (await import("../config/dropbox.js")).default
+      const accountInfo = await dbx.usersGetCurrentAccount()
+      dropboxStatus = "connected"
+    } catch (error) {
+      dropboxStatus = "failed"
+      dropboxError = error.message
+    }
+
+    // Test file existence in Dropbox
+    let fileExists = false
+    let fileError = null
+
+    try {
+      const fileBuffer = await downloadFromDropbox(document.dropboxPath)
+      fileExists = fileBuffer && fileBuffer.length > 0
+    } catch (error) {
+      fileError = error.message
+    }
+
+    res.json({
+      success: true,
+      document: {
+        id: document._id,
+        name: document.originalName,
+        size: document.size,
+        accessLevel: document.accessLevel,
+        dropboxPath: document.dropboxPath,
+        uploadedBy: document.uploadedBy?.username,
+      },
+      dropbox: {
+        status: dropboxStatus,
+        error: dropboxError,
+      },
+      file: {
+        exists: fileExists,
+        error: fileError,
+      },
+      user: {
+        id: req.user._id,
+        role: req.user.role,
+        email: req.user.email,
+      },
+    })
+  } catch (error) {
+    console.error("Test download error:", error)
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
+    })
+  }
+})
+
 // Upload document with version control and Dropbox storage
 router.post("/upload", authenticate, upload.single("document"), async (req, res) => {
   try {
@@ -259,39 +333,49 @@ router.get("/download/:id", authenticate, async (req, res) => {
   const startTime = Date.now()
   let document = null
 
+  // Wrap everything in try-catch to prevent crashes
   try {
-    console.log("\n" + "=".repeat(50))
-    console.log("🚀 DOWNLOAD REQUEST STARTED")
-    console.log("=".repeat(50))
-    console.log("📋 Request Details:")
-    console.log("  - Document ID:", req.params.id)
-    console.log("  - User ID:", req.user._id)
-    console.log("  - User Role:", req.user.role)
-    console.log("  - User Email:", req.user.email)
-    console.log("  - Query params:", req.query)
-    console.log("  - Timestamp:", new Date().toISOString())
+    // Basic request validation first
+    if (!req.params.id) {
+      console.error("❌ No document ID provided")
+      return res.status(400).json({
+        message: "Document ID is required",
+        error: "MISSING_DOCUMENT_ID",
+      })
+    }
 
-    const { pin } = req.query
-
-    // Validate document ID format
-    if (!req.params.id || req.params.id.length !== 24) {
-      console.log("❌ Invalid document ID format")
+    if (req.params.id.length !== 24) {
+      console.error("❌ Invalid document ID format:", req.params.id)
       return res.status(400).json({
         message: "Invalid document ID format",
         error: "INVALID_DOCUMENT_ID",
       })
     }
 
+    console.log("\n" + "=".repeat(50))
+    console.log("🚀 DOWNLOAD REQUEST STARTED")
+    console.log("=".repeat(50))
+    console.log("📋 Request Details:")
+    console.log("  - Document ID:", req.params.id)
+    console.log("  - User ID:", req.user?._id || "Unknown")
+    console.log("  - User Role:", req.user?.role || "Unknown")
+    console.log("  - User Email:", req.user?.email || "Unknown")
+    console.log("  - Query params:", JSON.stringify(req.query))
+    console.log("  - Timestamp:", new Date().toISOString())
+
+    const { pin } = req.query
+
     console.log("\n📊 Step 1: Finding document in database...")
 
-    // Find document with populated user data
+    // Find document with error handling
     try {
       document = await Document.findById(req.params.id).populate("uploadedBy", "username email _id")
     } catch (dbError) {
-      console.log("❌ Database query error:", dbError.message)
+      console.error("❌ Database query failed:", dbError.message)
       return res.status(500).json({
         message: "Database error while finding document",
         error: "DATABASE_ERROR",
+        details: dbError.message,
       })
     }
 
@@ -310,34 +394,25 @@ router.get("/download/:id", authenticate, async (req, res) => {
     console.log("  - Size:", document.size, "bytes")
     console.log("  - MIME Type:", document.mimetype)
     console.log("  - Uploaded By:", document.uploadedBy?.username || "Unknown")
-    console.log("  - Uploader ID:", document.uploadedBy?._id)
+    console.log("  - Uploader ID:", document.uploadedBy?._id || "Unknown")
     console.log("  - Dropbox Path:", document.dropboxPath)
     console.log("  - Created:", document.createdAt)
 
     // Validate required document fields
     console.log("\n🔍 Step 2: Validating document data...")
 
-    if (!document.dropboxPath) {
-      console.log("❌ Missing Dropbox path")
-      return res.status(500).json({
-        message: "File path not found. This file may have been corrupted during upload.",
-        error: "MISSING_DROPBOX_PATH",
-      })
-    }
+    const validationErrors = []
+    if (!document.dropboxPath) validationErrors.push("Missing Dropbox path")
+    if (!document.uploadedBy) validationErrors.push("Missing uploader information")
+    if (!document.originalName) validationErrors.push("Missing original filename")
+    if (!document.size || document.size <= 0) validationErrors.push("Invalid file size")
 
-    if (!document.uploadedBy) {
-      console.log("❌ Missing uploader information")
+    if (validationErrors.length > 0) {
+      console.error("❌ Document validation failed:", validationErrors)
       return res.status(500).json({
-        message: "File uploader information not found.",
-        error: "MISSING_UPLOADER",
-      })
-    }
-
-    if (!document.originalName) {
-      console.log("❌ Missing original filename")
-      return res.status(500).json({
-        message: "Original filename not found.",
-        error: "MISSING_FILENAME",
+        message: "Document data validation failed: " + validationErrors.join(", "),
+        error: "INVALID_DOCUMENT_DATA",
+        validationErrors,
       })
     }
 
@@ -349,24 +424,24 @@ router.get("/download/:id", authenticate, async (req, res) => {
     let hasAccess = false
     let accessReason = ""
 
-    if (document.accessLevel === "public") {
-      hasAccess = true
-      accessReason = "Public file - accessible to all users"
-    } else if (document.accessLevel === "private") {
-      if (req.user.role === "admin") {
+    try {
+      if (document.accessLevel === "public") {
         hasAccess = true
-        accessReason = "Admin access to private file"
-      } else if (document.uploadedBy._id.toString() === req.user._id.toString()) {
-        hasAccess = true
-        accessReason = "Owner access to private file"
-      } else {
-        accessReason = "Access denied - private file, user is not owner or admin"
-      }
-    } else if (document.accessLevel === "protected") {
-      if (pin) {
-        try {
+        accessReason = "Public file - accessible to all users"
+      } else if (document.accessLevel === "private") {
+        if (req.user.role === "admin") {
+          hasAccess = true
+          accessReason = "Admin access to private file"
+        } else if (document.uploadedBy._id.toString() === req.user._id.toString()) {
+          hasAccess = true
+          accessReason = "Owner access to private file"
+        } else {
+          accessReason = "Access denied - private file, user is not owner or admin"
+        }
+      } else if (document.accessLevel === "protected") {
+        if (pin) {
           if (!document.accessPin) {
-            console.log("❌ Protected file has no PIN hash stored")
+            console.error("❌ Protected file has no PIN hash stored")
             return res.status(500).json({
               message: "Protected file configuration error - no PIN set",
               error: "MISSING_PIN_HASH",
@@ -383,18 +458,19 @@ router.get("/download/:id", authenticate, async (req, res) => {
             accessReason = "Invalid PIN provided for protected file"
             console.log("❌ PIN verification failed")
           }
-        } catch (pinError) {
-          console.error("❌ PIN comparison error:", pinError)
-          return res.status(500).json({
-            message: "PIN verification failed due to server error",
-            error: "PIN_VERIFICATION_ERROR",
-          })
+        } else {
+          accessReason = "No PIN provided for protected file"
         }
       } else {
-        accessReason = "No PIN provided for protected file"
+        accessReason = "Unknown access level: " + document.accessLevel
       }
-    } else {
-      accessReason = "Unknown access level: " + document.accessLevel
+    } catch (accessError) {
+      console.error("❌ Access check failed:", accessError)
+      return res.status(500).json({
+        message: "Access permission check failed",
+        error: "ACCESS_CHECK_ERROR",
+        details: accessError.message,
+      })
     }
 
     console.log("🔐 Access Check Result:")
@@ -423,12 +499,13 @@ router.get("/download/:id", authenticate, async (req, res) => {
 
     console.log("✅ Access granted:", accessReason)
 
-    // Test Dropbox connection before attempting download
+    // Test Dropbox connection
     console.log("\n☁️ Step 4: Testing Dropbox connection...")
 
+    let dbxClient
     try {
-      const dbx = (await import("../config/dropbox.js")).default
-      const accountInfo = await dbx.usersGetCurrentAccount()
+      dbxClient = (await import("../config/dropbox.js")).default
+      const accountInfo = await dbxClient.usersGetCurrentAccount()
       console.log("✅ Dropbox connection successful")
       console.log("  - Account:", accountInfo.result.name.display_name)
       console.log("  - Email:", accountInfo.result.email)
@@ -437,6 +514,7 @@ router.get("/download/:id", authenticate, async (req, res) => {
       return res.status(500).json({
         message: "Cloud storage connection failed: " + connectionError.message,
         error: "DROPBOX_CONNECTION_ERROR",
+        details: connectionError.message,
       })
     }
 
@@ -450,7 +528,7 @@ router.get("/download/:id", authenticate, async (req, res) => {
       fileBuffer = await downloadFromDropbox(document.dropboxPath)
 
       if (!fileBuffer) {
-        console.log("❌ No file buffer returned from Dropbox")
+        console.error("❌ No file buffer returned from Dropbox")
         return res.status(500).json({
           message: "Failed to retrieve file from Dropbox storage - empty response",
           error: "EMPTY_FILE_BUFFER",
@@ -458,7 +536,7 @@ router.get("/download/:id", authenticate, async (req, res) => {
       }
 
       if (fileBuffer.length === 0) {
-        console.log("❌ Empty file buffer returned from Dropbox")
+        console.error("❌ Empty file buffer returned from Dropbox")
         return res.status(500).json({
           message: "Failed to retrieve file from Dropbox storage - empty file",
           error: "EMPTY_FILE_CONTENT",
@@ -475,7 +553,6 @@ router.get("/download/:id", authenticate, async (req, res) => {
         status: dropboxError.status,
         path: document.dropboxPath,
         documentId: document._id,
-        stack: dropboxError.stack?.split("\n").slice(0, 3).join("\n"), // First 3 lines of stack
       })
 
       if (dropboxError.message.includes("not found") || dropboxError.status === 409) {
@@ -552,10 +629,11 @@ router.get("/download/:id", authenticate, async (req, res) => {
   } catch (error) {
     const endTime = Date.now()
     console.error("\n" + "=".repeat(50))
-    console.error("❌ DOWNLOAD FAILED WITH ERROR")
+    console.error("❌ DOWNLOAD FAILED WITH CRITICAL ERROR")
     console.error("=".repeat(50))
-    console.error("💥 Error Details:")
+    console.error("💥 Critical Error Details:")
     console.error("  - Message:", error.message)
+    console.error("  - Name:", error.name)
     console.error("  - Stack:", error.stack?.split("\n").slice(0, 5).join("\n"))
     console.error("  - Document ID:", req.params.id)
     console.error("  - User ID:", req.user?._id)
@@ -572,11 +650,12 @@ router.get("/download/:id", authenticate, async (req, res) => {
     }
     console.error("=".repeat(50) + "\n")
 
+    // Only send response if headers haven't been sent
     if (!res.headersSent) {
       res.status(500).json({
-        message: "Download failed due to server error",
+        message: "Download failed due to critical server error",
         details: process.env.NODE_ENV === "development" ? error.message : "Please try again or contact support.",
-        error: "INTERNAL_SERVER_ERROR",
+        error: "CRITICAL_SERVER_ERROR",
         timestamp: new Date().toISOString(),
         documentId: req.params.id,
       })
