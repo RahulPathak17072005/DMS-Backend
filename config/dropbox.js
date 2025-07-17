@@ -1,4 +1,7 @@
 import { Dropbox } from "dropbox"
+import dotenv from "dotenv"
+
+dotenv.config()
 
 // Configure Dropbox client with proper error handling
 const createDropboxClient = () => {
