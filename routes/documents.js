@@ -22,6 +22,48 @@ router.get("/health", (req, res) => {
   })
 })
 
+// Public endpoint to list all documents (for debugging only)
+router.get("/list-all", async (req, res) => {
+  try {
+    console.log("📋 Listing all documents for debugging")
+
+    // Find all documents in the database
+    const documents = await Document.find()
+      .select("_id originalName dropboxPath accessLevel size createdAt")
+      .sort({ createdAt: -1 })
+      .limit(20) // Limit to 20 most recent documents
+
+    if (!documents || documents.length === 0) {
+      return res.json({
+        success: false,
+        message: "No documents found in the database",
+        timestamp: new Date().toISOString(),
+      })
+    }
+
+    res.json({
+      success: true,
+      count: documents.length,
+      documents: documents.map((doc) => ({
+        id: doc._id,
+        name: doc.originalName,
+        path: doc.dropboxPath,
+        accessLevel: doc.accessLevel,
+        size: doc.size,
+        createdAt: doc.createdAt,
+      })),
+      timestamp: new Date().toISOString(),
+    })
+  } catch (error) {
+    console.error("Error listing documents:", error)
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString(),
+    })
+  }
+})
+
 // Public test endpoint to check document existence (no auth required)
 router.get("/test-document/:id", async (req, res) => {
   try {
