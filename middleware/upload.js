@@ -76,8 +76,8 @@ export const uploadToDropbox = async (fileBuffer, filename, originalName) => {
 // Function to download file from Dropbox with better error handling
 export const downloadFromDropbox = async (dropboxPath) => {
   try {
-    console.log("=== DROPBOX DOWNLOAD START ===")
-    console.log("Requested path:", dropboxPath)
+    console.log("  📥 Starting Dropbox download...")
+    console.log("    - Path:", dropboxPath)
 
     if (!dropboxPath) {
       throw new Error("Dropbox path is required")
@@ -85,59 +85,66 @@ export const downloadFromDropbox = async (dropboxPath) => {
 
     // Ensure path starts with /
     const normalizedPath = dropboxPath.startsWith("/") ? dropboxPath : `/${dropboxPath}`
-    console.log("Normalized path:", normalizedPath)
+    console.log("    - Normalized Path:", normalizedPath)
 
-    // Test Dropbox connection first
+    // Import Dropbox client
+    let dbxClient
     try {
-      console.log("Testing Dropbox connection...")
-      await dbx.usersGetCurrentAccount()
-      console.log("✅ Dropbox connection successful")
+      dbxClient = (await import("../config/dropbox.js")).default
+      console.log("    ✅ Dropbox client imported successfully")
+    } catch (importError) {
+      console.error("    ❌ Failed to import Dropbox client:", importError)
+      throw new Error("Failed to initialize Dropbox client: " + importError.message)
+    }
+
+    // Test connection first
+    console.log("    🔗 Testing Dropbox connection...")
+    try {
+      const accountInfo = await dbxClient.usersGetCurrentAccount()
+      console.log("    ✅ Connection test successful")
+      console.log("      - Account:", accountInfo.result.name.display_name)
     } catch (connectionError) {
-      console.error("❌ Dropbox connection failed:", connectionError)
+      console.error("    ❌ Connection test failed:", connectionError)
       throw new Error("Dropbox connection failed: " + connectionError.message)
     }
 
-    console.log("Attempting file download...")
-    const response = await dbx.filesDownload({ path: normalizedPath })
+    // Attempt file download
+    console.log("    📁 Attempting file download...")
+    const response = await dbxClient.filesDownload({ path: normalizedPath })
 
     if (!response) {
-      console.error("❌ No response from Dropbox")
+      console.error("    ❌ No response from Dropbox API")
       throw new Error("No response from Dropbox API")
     }
 
     if (!response.result) {
-      console.error("❌ No result in Dropbox response")
+      console.error("    ❌ No result in Dropbox response")
       throw new Error("Invalid response structure from Dropbox")
     }
 
     const fileBuffer = response.result.fileBinary
     if (!fileBuffer) {
-      console.error("❌ No file binary in response")
+      console.error("    ❌ No file binary in response")
       throw new Error("No file data returned from Dropbox")
     }
 
-    console.log("✅ Dropbox download successful")
-    console.log("File metadata:", {
-      name: response.result.name,
-      size: fileBuffer.length,
-      path: response.result.path_display,
-    })
-    console.log("=== DROPBOX DOWNLOAD END ===")
+    console.log("    ✅ Dropbox download successful")
+    console.log("      - File Name:", response.result.name)
+    console.log("      - File Size:", fileBuffer.length, "bytes")
+    console.log("      - Path Display:", response.result.path_display)
+    console.log("      - Content Hash:", response.result.content_hash?.substring(0, 10) + "...")
 
     return fileBuffer
   } catch (error) {
-    console.error("=== DROPBOX DOWNLOAD ERROR ===")
-    console.error("Error details:", {
-      message: error.message,
-      status: error.status,
-      error_summary: error.error?.error_summary,
-      path: dropboxPath,
-      stack: error.stack,
-    })
+    console.error("  ❌ Dropbox download error:")
+    console.error("    - Message:", error.message)
+    console.error("    - Status:", error.status)
+    console.error("    - Error Summary:", error.error?.error_summary)
+    console.error("    - Path:", dropboxPath)
 
     if (error.status === 409) {
       // File not found
-      const errorDetails = error.error?.error?.[".tag"] || "unknown"
+      const errorDetails = error.error?.error?.[".tag"] || "file_not_found"
       throw new Error(`File not found in Dropbox: ${errorDetails}`)
     } else if (error.status === 401) {
       // Authentication error
