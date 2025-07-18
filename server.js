@@ -18,6 +18,11 @@ const PORT = process.env.PORT || 5000
 const requiredEnvVars = ["MONGODB_URI", "JWT_SECRET", "DROPBOX_ACCESS_TOKEN"]
 const missingEnvVars = requiredEnvVars.filter((envVar) => !process.env[envVar])
 
+import { initializeDropboxWithBufferFix } from "./middleware/upload.js"
+await initializeDropboxWithBufferFix()
+
+
+
 if (missingEnvVars.length > 0) {
   console.error("❌ Missing required environment variables:", missingEnvVars)
   console.error("Please check your .env file and ensure all required variables are set")

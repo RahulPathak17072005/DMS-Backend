@@ -80,7 +80,7 @@ export const uploadToDropbox = async (fileBuffer, filename, originalName) => {
   }
 }
 
-// Function to download file from Dropbox with better error handling
+// Function to download file from Dropbox with SDK compatibility fix
 export const downloadFromDropbox = async (dropboxPath) => {
   try {
     console.log("📥 Starting Dropbox download for path:", dropboxPath)
@@ -103,26 +103,118 @@ export const downloadFromDropbox = async (dropboxPath) => {
     // Test connection first
     try {
       await dbxClient.usersGetCurrentAccount()
+      console.log("✅ Dropbox connection verified")
     } catch (connectionError) {
       throw new Error("Dropbox connection failed: " + connectionError.message)
     }
 
-    // Attempt file download
-    const response = await dbxClient.filesDownload({ path: normalizedPath })
-
-    if (!response || !response.result || !response.result.fileBinary) {
-      throw new Error("Invalid response from Dropbox API")
+    // Method 1: Try the standard filesDownload (this might fail with the buffer error)
+    try {
+      console.log("🔄 Attempting standard filesDownload...")
+      const response = await dbxClient.filesDownload({ path: normalizedPath })
+      
+      if (response && response.result && response.result.fileBinary) {
+        let fileContent = response.result.fileBinary
+        
+        // Convert to Buffer if needed
+        if (Buffer.isBuffer(fileContent)) {
+          console.log("✅ Got Buffer directly from filesDownload, size:", fileContent.length)
+          return fileContent
+        } else if (fileContent instanceof Uint8Array) {
+          console.log("✅ Converting Uint8Array to Buffer, size:", fileContent.length)
+          return Buffer.from(fileContent)
+        } else if (fileContent instanceof ArrayBuffer) {
+          console.log("✅ Converting ArrayBuffer to Buffer, size:", fileContent.byteLength)
+          return Buffer.from(fileContent)
+        }
+      }
+    } catch (downloadError) {
+      console.log("⚠️ Standard filesDownload failed:", downloadError.message)
+      
+      // If it's the buffer error, try alternative method
+      if (downloadError.message.includes("res.buffer is not a function")) {
+        console.log("🔄 Trying alternative download method...")
+        
+        // Method 2: Use a raw HTTP request to bypass the SDK's response parsing
+        try {
+          const fetch = (await import("node-fetch")).default
+          
+          // Get a temporary download link
+          const linkResponse = await dbxClient.filesGetTemporaryLink({ path: normalizedPath })
+          
+          if (linkResponse && linkResponse.result && linkResponse.result.link) {
+            console.log("✅ Got temporary download link")
+            
+            // Download using fetch
+            const fetchResponse = await fetch(linkResponse.result.link)
+            
+            if (!fetchResponse.ok) {
+              throw new Error(`HTTP error! status: ${fetchResponse.status}`)
+            }
+            
+            const arrayBuffer = await fetchResponse.arrayBuffer()
+            const fileContent = Buffer.from(arrayBuffer)
+            
+            console.log("✅ Downloaded via temporary link, size:", fileContent.length)
+            return fileContent
+          }
+        } catch (linkError) {
+          console.log("⚠️ Temporary link method failed:", linkError.message)
+        }
+        
+        // Method 3: Try using the sharing API as a fallback
+        try {
+          console.log("🔄 Trying sharing API method...")
+          
+          // Create a shared link
+          const shareResponse = await dbxClient.sharingCreateSharedLinkWithSettings({
+            path: normalizedPath,
+            settings: {
+              requested_visibility: "public"
+            }
+          })
+          
+          if (shareResponse && shareResponse.result && shareResponse.result.url) {
+            const sharedUrl = shareResponse.result.url.replace("www.dropbox.com", "dl.dropboxusercontent.com")
+            
+            const fetch = (await import("node-fetch")).default
+            const fetchResponse = await fetch(sharedUrl)
+            
+            if (!fetchResponse.ok) {
+              throw new Error(`HTTP error! status: ${fetchResponse.status}`)
+            }
+            
+            const arrayBuffer = await fetchResponse.arrayBuffer()
+            const fileContent = Buffer.from(arrayBuffer)
+            
+            console.log("✅ Downloaded via shared link, size:", fileContent.length)
+            
+            // Clean up the shared link
+            try {
+              await dbxClient.sharingRevokeSharedLink({ url: shareResponse.result.url })
+            } catch (cleanupError) {
+              console.warn("⚠️ Failed to clean up shared link:", cleanupError.message)
+            }
+            
+            return fileContent
+          }
+        } catch (shareError) {
+          console.log("⚠️ Sharing API method failed:", shareError.message)
+        }
+      }
+      
+      // If all methods failed, throw the original error
+      throw downloadError
     }
 
-    const fileBuffer = response.result.fileBinary
-    console.log("✅ Dropbox download successful, size:", fileBuffer.length)
+    throw new Error("All download methods failed")
 
-    return fileBuffer
   } catch (error) {
     console.error("❌ Dropbox download error:", {
       message: error.message,
       status: error.status,
       path: dropboxPath,
+      stack: error.stack
     })
 
     if (error.status === 409) {
@@ -136,6 +228,35 @@ export const downloadFromDropbox = async (dropboxPath) => {
     } else {
       throw new Error(`Dropbox download failed: ${error.message}`)
     }
+  }
+}
+
+// Alternative: Monkey patch the Dropbox SDK to fix the buffer issue
+export const initializeDropboxWithBufferFix = async () => {
+  try {
+    // This is a workaround for the res.buffer is not a function issue
+    const originalFetch = global.fetch
+    
+    if (originalFetch) {
+      global.fetch = async (url, options) => {
+        const response = await originalFetch(url, options)
+        
+        // Add buffer method if it doesn't exist
+        if (!response.buffer && response.arrayBuffer) {
+          response.buffer = async () => {
+            const arrayBuffer = await response.arrayBuffer()
+            return Buffer.from(arrayBuffer)
+          }
+        }
+        
+        return response
+      }
+    }
+    
+    return true
+  } catch (error) {
+    console.error("Failed to initialize Dropbox buffer fix:", error)
+    return false
   }
 }
 
