@@ -295,6 +295,204 @@ router.get("/test-download/:id", authenticate, async (req, res) => {
   }
 })
 
+// NEW: Preview endpoint for file viewing before download
+router.get("/preview/:id", authenticate, async (req, res) => {
+  try {
+    console.log("👁️ =================================")
+    console.log("👁️ PREVIEW REQUEST STARTED")
+    console.log("👁️ Document ID:", req.params.id)
+    console.log("👁️ User:", req.user?.email, "Role:", req.user?.role)
+    console.log("👁️ =================================")
+
+    // Find document
+    const document = await Document.findById(req.params.id).populate("uploadedBy", "username email _id")
+
+    if (!document) {
+      console.log("❌ Document not found")
+      return res.status(404).json({
+        message: "Document not found",
+        error: "NOT_FOUND",
+      })
+    }
+
+    console.log("📄 Preview document:", document.originalName)
+    console.log("📄 File type:", document.mimetype)
+    console.log("📄 Access level:", document.accessLevel)
+
+    // Check access permissions (same as download)
+    const { pin } = req.query
+    let hasAccess = false
+    let accessReason = ""
+
+    if (document.accessLevel === "public") {
+      hasAccess = true
+      accessReason = "Public file"
+    } else if (document.accessLevel === "private") {
+      if (req.user.role === "admin") {
+        hasAccess = true
+        accessReason = "Admin access"
+      } else if (document.uploadedBy._id.toString() === req.user._id.toString()) {
+        hasAccess = true
+        accessReason = "Owner access"
+      } else {
+        accessReason = "Private file - access denied"
+      }
+    } else if (document.accessLevel === "protected") {
+      if (pin && document.accessPin) {
+        const isValidPin = await bcrypt.compare(pin, document.accessPin)
+        if (isValidPin) {
+          hasAccess = true
+          accessReason = "Valid PIN provided"
+        } else {
+          accessReason = "Invalid PIN"
+        }
+      } else {
+        accessReason = "PIN required"
+      }
+    }
+
+    console.log("🔐 Access check result:", hasAccess, "-", accessReason)
+
+    if (!hasAccess) {
+      console.log("❌ Preview access denied:", accessReason)
+      if (document.accessLevel === "protected" && !pin) {
+        return res.status(401).json({
+          message: "PIN required for protected document",
+          requiresPin: true,
+          error: "PIN_REQUIRED",
+        })
+      }
+      return res.status(403).json({
+        message: "Access denied: " + accessReason,
+        error: "ACCESS_DENIED",
+      })
+    }
+
+    console.log("✅ Preview access granted:", accessReason)
+
+    // Download file from Dropbox
+    console.log("📥 Downloading file from Dropbox for preview...")
+    const fileBuffer = await downloadFromDropbox(document.dropboxPath)
+
+    if (!fileBuffer || fileBuffer.length === 0) {
+      console.log("❌ Empty file received from Dropbox")
+      return res.status(500).json({
+        message: "Empty file received from Dropbox",
+        error: "EMPTY_FILE",
+      })
+    }
+
+    console.log("✅ File downloaded for preview, size:", fileBuffer.length)
+
+    // Set appropriate headers for preview
+    res.setHeader("Content-Type", document.mimetype || "application/octet-stream")
+    res.setHeader("Content-Length", fileBuffer.length)
+    res.setHeader("Cache-Control", "private, max-age=3600") // Cache for 1 hour
+
+    // For PDFs and images, allow inline viewing
+    if (document.mimetype === "application/pdf" || document.mimetype.startsWith("image/")) {
+      res.setHeader("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(document.originalName)}`)
+      console.log("📄 Set headers for inline viewing (PDF/Image)")
+    } else {
+      // For text files, also allow inline
+      if (
+        document.mimetype.includes("text/") ||
+        document.originalName.toLowerCase().endsWith(".txt") ||
+        document.originalName.toLowerCase().endsWith(".json") ||
+        document.originalName.toLowerCase().endsWith(".csv") ||
+        document.originalName.toLowerCase().endsWith(".md")
+      ) {
+        res.setHeader("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(document.originalName)}`)
+        res.setHeader("Content-Type", "text/plain; charset=utf-8")
+        console.log("📝 Set headers for text file viewing")
+      } else {
+        // For other files, suggest download
+        res.setHeader(
+          "Content-Disposition",
+          `attachment; filename*=UTF-8''${encodeURIComponent(document.originalName)}`,
+        )
+        console.log("📎 Set headers for download (unsupported preview)")
+      }
+    }
+
+    res.send(fileBuffer)
+    console.log("✅ Preview sent successfully!")
+    console.log("👁️ =================================")
+  } catch (error) {
+    console.error("❌ Preview error:", error)
+
+    if (error.message.includes("Dropbox")) {
+      res.status(500).json({
+        message: "Cloud storage error: " + error.message,
+        error: "DROPBOX_ERROR",
+      })
+    } else {
+      res.status(500).json({
+        message: "Preview failed: " + error.message,
+        error: "PREVIEW_ERROR",
+      })
+    }
+  }
+})
+
+// Add a debug endpoint to test preview functionality
+router.get("/debug-preview/:id", authenticate, async (req, res) => {
+  try {
+    console.log("🐛 DEBUG PREVIEW - Document ID:", req.params.id)
+
+    // Find document
+    const document = await Document.findById(req.params.id).populate("uploadedBy", "username email _id")
+
+    if (!document) {
+      return res.json({
+        success: false,
+        error: "Document not found",
+        documentId: req.params.id,
+      })
+    }
+
+    // Test file download
+    let fileBuffer
+    let downloadError = null
+    try {
+      fileBuffer = await downloadFromDropbox(document.dropboxPath)
+    } catch (error) {
+      downloadError = error.message
+    }
+
+    res.json({
+      success: true,
+      document: {
+        id: document._id,
+        name: document.originalName,
+        mimetype: document.mimetype,
+        size: document.size,
+        accessLevel: document.accessLevel,
+        dropboxPath: document.dropboxPath,
+      },
+      file: {
+        downloaded: !!fileBuffer,
+        actualSize: fileBuffer ? fileBuffer.length : 0,
+        expectedSize: document.size,
+        sizeMatch: fileBuffer ? fileBuffer.length === document.size : false,
+        downloadError: downloadError,
+      },
+      previewSupported: {
+        isImage: document.mimetype && document.mimetype.startsWith("image/"),
+        isPDF: document.mimetype === "application/pdf",
+        isText: document.mimetype && document.mimetype.includes("text/"),
+        mimetype: document.mimetype,
+      },
+    })
+  } catch (error) {
+    console.error("Debug preview error:", error)
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    })
+  }
+})
+
 // Upload document with version control and Dropbox storage
 router.post("/upload", authenticate, upload.single("document"), async (req, res) => {
   try {
